@@ -165,6 +165,7 @@ class HierarchicalVolumeDecoding:
         octree_resolution: int = None,
         min_resolution: int = 63,
         enable_pbar: bool = True,
+        output_on_cpu: bool = False,
         **kwargs,
     ):
         device = latents.device
@@ -211,18 +212,32 @@ class HierarchicalVolumeDecoding:
         grid_logits = torch.cat(batch_logits, dim=1).view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
 
         for octree_depth_now in resolutions[1:]:
+            is_last_step = (octree_depth_now == resolutions[-1])
+            target_device = 'cpu' if (is_last_step and output_on_cpu) else device
+            
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
-            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
-            next_logits = torch.full(next_index.shape, -10000., dtype=dtype, device=device)
-            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
-            curr_points += grid_logits.squeeze(0).abs() < 0.95
+            
+            # Ensure dilation kernel is on the correct device
+            dilate = dilate.to(target_device)
+
+            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=target_device)
+            
+            # Extract points on target device
+            if grid_logits.device.type != (target_device if isinstance(target_device, str) else target_device.type):
+                 grid_slice = grid_logits.squeeze(0).to(target_device)
+            else:
+                 grid_slice = grid_logits.squeeze(0)
+
+            curr_points = extract_near_surface_volume_fn(grid_slice, mc_level)
+            curr_points += grid_slice.abs() < 0.95
 
             if octree_depth_now == resolutions[-1]:
                 expand_num = 0
             else:
                 expand_num = 1
             for i in range(expand_num):
+                curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
                 curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
             (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
@@ -233,9 +248,10 @@ class HierarchicalVolumeDecoding:
             # Store shape before deleting
             next_index_shape = next_index.shape
             del next_index
-            torch.cuda.empty_cache()
+            if str(target_device) == 'cuda':
+                torch.cuda.empty_cache()
 
-            next_points = torch.stack(nidx, dim=1)
+            next_points = torch.stack(nidx, dim=1).to(device)
             next_points = (next_points * torch.tensor(resolution, dtype=next_points.dtype, device=device) +
                            torch.tensor(bbox_min, dtype=next_points.dtype, device=device))
             batch_logits = []
@@ -247,9 +263,15 @@ class HierarchicalVolumeDecoding:
                 batch_logits.append(logits)
 
             # Delayed allocation of next_logits
-            next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=device)
+            next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=target_device)
             grid_logits = torch.cat(batch_logits, dim=1)
-            next_logits[nidx] = grid_logits[0, ..., 0]
+            
+            if target_device == 'cpu':
+                nidx_cpu = tuple(idx.cpu() for idx in nidx)
+                next_logits[nidx_cpu] = grid_logits[0, ..., 0].cpu()
+            else:
+                next_logits[nidx] = grid_logits[0, ..., 0]
+
             grid_logits = next_logits.unsqueeze(0)
         grid_logits[grid_logits == -10000.] = float('nan')
 
@@ -278,6 +300,7 @@ class FlashVDMVolumeDecoding:
         min_resolution: int = 63,
         mini_grid_num: int = 4,
         enable_pbar: bool = True,
+        output_on_cpu: bool = False,
         **kwargs,
     ):
         processor = self.processor
@@ -361,11 +384,30 @@ class FlashVDMVolumeDecoding:
         )
 
         for octree_depth_now in resolutions[1:]:
+            is_last_step = (octree_depth_now == resolutions[-1])
+            target_device = 'cpu' if (is_last_step and output_on_cpu) else device
+            
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
-            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
-            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
-            curr_points += grid_logits.squeeze(0).abs() < 0.95
+            
+            # Ensure dilation kernel is on the correct device
+            dilate = dilate.to(target_device)
+
+            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=target_device)
+            
+            # Extract points on target device
+            # grid_logits might be on GPU from previous step
+            # Compare device types safely
+            gl_dev_type = grid_logits.device.type
+            tgt_dev_type = target_device if isinstance(target_device, str) else target_device.type
+            
+            if gl_dev_type != tgt_dev_type:
+                 grid_slice = grid_logits.squeeze(0).to(target_device)
+            else:
+                 grid_slice = grid_logits.squeeze(0)
+
+            curr_points = extract_near_surface_volume_fn(grid_slice, mc_level)
+            curr_points += grid_slice.abs() < 0.95
 
             if octree_depth_now == resolutions[-1]:
                 expand_num = 0
@@ -384,9 +426,12 @@ class FlashVDMVolumeDecoding:
             # Store shape before deleting
             next_index_shape = next_index.shape
             del next_index
-            torch.cuda.empty_cache()
+            if tgt_dev_type == 'cuda':
+                torch.cuda.empty_cache()
 
-            next_points = torch.stack(nidx, dim=1)
+            # Prepare queries for model (Must be on GPU)
+            # nidx is on target_device (CPU or GPU). If CPU, stack then move to GPU.
+            next_points = torch.stack(nidx, dim=1).to(device)
             next_points = (next_points * torch.tensor(resolution, dtype=torch.float32, device=device) +
                            torch.tensor(bbox_min, dtype=torch.float32, device=device))
 
@@ -399,7 +444,10 @@ class FlashVDMVolumeDecoding:
             index = index.sort()
             next_points = next_points[index.indices].unsqueeze(0).contiguous()
             unique_values = torch.unique(index.values, return_counts=True)
-            grid_logits = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=latents.device)
+            
+            # grid_values to store model output (keep on GPU)
+            grid_values = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=device)
+            
             input_grid = [[], []]
             logits_grid_list = []
             start_num = 0
@@ -427,12 +475,19 @@ class FlashVDMVolumeDecoding:
                 processor.topk = input_grid
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
                 logits_grid_list.append(logits_grid)
+            
             logits_grid = torch.cat(logits_grid_list, dim=1)
-            grid_logits[index.indices] = logits_grid.squeeze(0).squeeze(-1)
+            grid_values[index.indices] = logits_grid.squeeze(0).squeeze(-1)
 
-            # Delayed allocation of next_logits
-            next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=device)
-            next_logits[nidx] = grid_logits
+            # Delayed allocation of next_logits (Dense Volume)
+            next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=target_device)
+            
+            if target_device == 'cpu':
+                 nidx_cpu = tuple(idx.cpu() for idx in nidx)
+                 next_logits[nidx_cpu] = grid_values.cpu()
+            else:
+                 next_logits[nidx] = grid_values
+                 
             grid_logits = next_logits.unsqueeze(0)
 
         grid_logits[grid_logits == -10000.] = float('nan')

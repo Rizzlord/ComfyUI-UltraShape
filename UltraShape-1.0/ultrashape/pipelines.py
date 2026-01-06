@@ -678,6 +678,7 @@ class DiTPipeline:
                 octree_resolution=octree_resolution,
                 mc_algo=mc_algo,
                 enable_pbar=enable_pbar,
+                output_on_cpu=True,
             )
         else:
             outputs = latents
