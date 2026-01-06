@@ -574,6 +574,7 @@ class DiTPipeline:
         mc_algo=None,
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
+        output_on_cpu=True,
         **kwargs,
     ) -> List[List[trimesh.Trimesh]]:
         callback = kwargs.pop("callback", None)
@@ -654,6 +655,7 @@ class DiTPipeline:
             latents,
             output_type,
             box_v, mc_level, num_chunks, octree_resolution, mc_algo,
+            output_on_cpu=output_on_cpu,
         )
 
     def _export(
@@ -665,7 +667,8 @@ class DiTPipeline:
         num_chunks=20000,
         octree_resolution=256,
         mc_algo='mc',
-        enable_pbar=True
+        enable_pbar=True,
+        output_on_cpu=True,
     ):
         if not output_type == "latent":
             latents = 1. / self.vae.scale_factor * latents
@@ -678,7 +681,7 @@ class DiTPipeline:
                 octree_resolution=octree_resolution,
                 mc_algo=mc_algo,
                 enable_pbar=enable_pbar,
-                output_on_cpu=True,
+                output_on_cpu=output_on_cpu,
             )
         else:
             outputs = latents
@@ -710,6 +713,7 @@ class UltraShapePipeline(DiTPipeline):
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
         mask = None,
+        output_on_cpu=True,
         **kwargs,
     ) -> List[List[trimesh.Trimesh]]:
         callback = kwargs.pop("callback", None)
@@ -795,4 +799,5 @@ class UltraShapePipeline(DiTPipeline):
             output_type,
             box_v, mc_level, num_chunks, octree_resolution, mc_algo,
             enable_pbar=enable_pbar,
+            output_on_cpu=output_on_cpu,
         ), latents

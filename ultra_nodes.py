@@ -140,6 +140,7 @@ class UltraShapeRefine:
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "remove_bg": ("BOOLEAN", {"default": False}),
                 "low_vram": ("BOOLEAN", {"default": True}),
+                "output_on_cpu": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -148,7 +149,7 @@ class UltraShapeRefine:
     FUNCTION = "refine"
     CATEGORY = "UltraShape"
 
-    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, low_vram):
+    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, low_vram, output_on_cpu):
         components = ultrashape_model["components"]
         config = ultrashape_model["config"]
         
@@ -212,7 +213,8 @@ class UltraShapeRefine:
                 mc_level=0.0,
                 octree_resolution=octree_res,
                 num_chunks=chunk_size,
-                num_inference_steps=steps
+                num_inference_steps=steps,
+                output_on_cpu=output_on_cpu,
             )
             
         refined_mesh = mesh_out_list[0]
