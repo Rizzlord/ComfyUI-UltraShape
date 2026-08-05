@@ -36,6 +36,7 @@ from tqdm import tqdm
 
 from .models.autoencoders import ShapeVAE
 from .models.autoencoders import SurfaceExtractors
+from .schedulers import get_adaptive_cfg_schedule
 from .utils import logger, synchronize_timer, smart_load_model
 
 
@@ -714,6 +715,11 @@ class UltraShapePipeline(DiTPipeline):
         enable_pbar=True,
         mask = None,
         output_on_cpu=True,
+        adaptive_cfg: bool = False,
+        cfg_min: float = 1.0,
+        cfg_max: Optional[float] = None,
+        cfg_start_ratio: float = 0.0,
+        cfg_end_ratio: float = 1.0,
         **kwargs,
     ) -> List[List[trimesh.Trimesh]]:
         callback = kwargs.pop("callback", None)
@@ -728,7 +734,6 @@ class UltraShapePipeline(DiTPipeline):
             self.model.guidance_embed is True
         )
 
-        # print('image', type(image), 'mask', type(mask))
         cond_inputs = self.prepare_image(image, mask)
         image = cond_inputs.pop('image')
         cond = self.encode_cond(
@@ -740,8 +745,6 @@ class UltraShapePipeline(DiTPipeline):
 
         batch_size = image.shape[0]
 
-        # 5. Prepare timesteps
-        # NOTE: this is slightly different from common usage, we start from 0.
         sigmas = np.linspace(0, 1, num_inference_steps) if sigmas is None else sigmas
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -751,29 +754,36 @@ class UltraShapePipeline(DiTPipeline):
         )
         latents_shape = None
         if voxel_cond is not None:
-             # voxel_cond: [B, N, 3] -> [N, 3] if batched? No, it's [B, N, 3] usually
-             # The encoder expects [B, N, 3]
              num_tokens = voxel_cond.shape[1]
              latents_shape = (num_tokens, self.vae.latent_shape[-1])
 
         latents = self.prepare_latents(batch_size, dtype, device, generator, shape=latents_shape)
 
+        target_cfg_max = guidance_scale if cfg_max is None else cfg_max
+        cfg_schedule = get_adaptive_cfg_schedule(
+            num_steps=num_inference_steps,
+            cfg_min=cfg_min,
+            cfg_max=target_cfg_max,
+            cfg_start_ratio=cfg_start_ratio,
+            cfg_end_ratio=cfg_end_ratio,
+            adaptive_cfg=adaptive_cfg,
+            default_cfg=guidance_scale,
+        )
+
         guidance = None
-        if hasattr(self.model, 'guidance_embed') and \
-            self.model.guidance_embed is True:
-            guidance = torch.tensor([guidance_scale] * batch_size, device=device, dtype=dtype)
-            # logger.info(f'Using guidance embed with scale {guidance_scale}')
         if do_classifier_free_guidance and voxel_cond is not None:
             voxel_cond = torch.cat([voxel_cond] * 2)
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):
-                # expand the latents if we are doing classifier free guidance
+                current_guidance_scale = cfg_schedule[i]
+                if hasattr(self.model, 'guidance_embed') and self.model.guidance_embed is True:
+                    guidance = torch.tensor([current_guidance_scale] * batch_size, device=device, dtype=dtype)
+
                 if do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
 
-                # NOTE: we assume model get timesteps ranged from 0 to 1
                 timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype).to(latent_model_input.device)
                 timestep = timestep / self.scheduler.config.num_train_timesteps
                 if voxel_cond is None:
@@ -784,9 +794,8 @@ class UltraShapePipeline(DiTPipeline):
 
                 if do_classifier_free_guidance:
                     noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + current_guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
                 outputs = self.scheduler.step(noise_pred, t, latents)
                 latents = outputs.prev_sample
 

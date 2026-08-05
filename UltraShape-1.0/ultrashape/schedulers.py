@@ -478,3 +478,49 @@ class ConsistencyFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
+
+
+def get_adaptive_cfg_schedule(
+    num_steps: int,
+    cfg_min: float = 1.0,
+    cfg_max: float = 5.0,
+    cfg_start_ratio: float = 0.0,
+    cfg_end_ratio: float = 1.0,
+    adaptive_cfg: bool = True,
+    default_cfg: float = 5.0,
+) -> List[float]:
+    if not adaptive_cfg:
+        return [float(default_cfg)] * num_steps
+
+    if num_steps <= 0:
+        return []
+
+    if num_steps == 1:
+        eff_max = float(cfg_max if cfg_max is not None else default_cfg)
+        return [eff_max]
+
+    raw_values = []
+    denom = float(num_steps - 1)
+    ratio_span = float(cfg_end_ratio - cfg_start_ratio)
+
+    for i in range(num_steps):
+        p_i = float(i) / denom
+        if p_i <= cfg_start_ratio or p_i >= cfg_end_ratio or ratio_span <= 0:
+            r_i = 0.0
+        else:
+            u_i = (p_i - cfg_start_ratio) / ratio_span
+            r_i = math.sin(math.pi * u_i)
+        raw_values.append(r_i)
+
+    max_raw = max(raw_values)
+    if max_raw > 0:
+        norm_weights = [r / max_raw for r in raw_values]
+    else:
+        norm_weights = [0.0] * num_steps
+
+    eff_max = float(cfg_max if cfg_max is not None else default_cfg)
+    schedule = [
+        float(cfg_min + (eff_max - cfg_min) * w) for w in norm_weights
+    ]
+    return schedule
+

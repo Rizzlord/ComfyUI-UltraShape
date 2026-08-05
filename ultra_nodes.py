@@ -8,7 +8,6 @@ from omegaconf import OmegaConf
 import folder_paths
 from huggingface_hub import hf_hub_download
 
-# Ensure UltraShape-1.0 is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 ultrashape_path = os.path.join(current_dir, "UltraShape-1.0")
 if ultrashape_path not in sys.path:
@@ -25,16 +24,16 @@ try:
 except ImportError as e:
     ULTRASHAPE_IMPORT_ERROR = e
     print(f"Error importing UltraShape modules: {e}")
-    # We might want to handle this gracefully if dependencies are missing during startup
     pass
 
-# Register model folder
 ultrashape_models_dir = os.path.join(folder_paths.models_dir, "ultrashape")
 if not os.path.exists(ultrashape_models_dir):
     os.makedirs(ultrashape_models_dir, exist_ok=True)
 folder_paths.add_model_folder_path("ultrashape", ultrashape_models_dir)
 
 class UltraShapeModelLoader:
+    DESCRIPTION = "Loads the UltraShape model checkpoint and instantiates VAE, DiT, Conditioner, Scheduler, and Image Processor."
+
     @classmethod
     def INPUT_TYPES(s):
         files = folder_paths.get_filename_list("ultrashape")
@@ -42,8 +41,8 @@ class UltraShapeModelLoader:
             files = ["ultrashape_v1.pt"]
         return {
             "required": {
-                "ckpt_name": (files,),
-                "download_if_missing": ("BOOLEAN", {"default": True}),
+                "ckpt_name": (files, {"tooltip": "Name of the UltraShape checkpoint file."}),
+                "download_if_missing": ("BOOLEAN", {"default": True, "tooltip": "Automatically download checkpoint from Hugging Face if missing."}),
             }
         }
 
@@ -64,19 +63,14 @@ class UltraShapeModelLoader:
                 try:
                     ckpt_path = hf_hub_download(
                         repo_id="infinith/UltraShape",
-                        filename="ultrashape_v1.pt", # Defaulting to known filename if generic name passed
+                        filename="ultrashape_v1.pt",
                         local_dir=ultrashape_models_dir
                     )
-                    # If the downloaded file is not what we asked for (e.g. user selected something else but we forced dl), handle it.
-                    # Here we assume user selects ultrashape_v1.pt or we download it.
                 except Exception as e:
                     raise RuntimeError(f"Failed to download model: {e}")
             else:
                 raise FileNotFoundError(f"Checkpoint {ckpt_name} not found and download disabled.")
         
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load config
         config_path = os.path.join(ultrashape_path, "configs", "infer_dit_refine.yaml")
         if not os.path.exists(config_path):
              raise FileNotFoundError(f"Config not found at {config_path}")
@@ -104,8 +98,6 @@ class UltraShapeModelLoader:
         dit.load_state_dict(weights['dit'], strict=True)
         conditioner.load_state_dict(weights['conditioner'], strict=True)
         
-        # Keep on CPU to avoid immediate OOM.
-        # Refine node will handle device placement.
         vae.eval()
         dit.eval()
         conditioner.eval()
@@ -124,25 +116,32 @@ class UltraShapeModelLoader:
         return ({"components": components, "config": config},)
 
 class UltraShapeRefine:
+    DESCRIPTION = "Refines an input 3D mesh conditioned on a reference image using UltraShape with optional adaptive CFG schedule."
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ultrashape_model": ("ULTRASHAPE_MODEL",),
-                "image": ("IMAGE",),
-                "mesh": ("TRIMESH",),
-                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
-                "guidance_scale": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1}),
-                "scale": ("FLOAT", {"default": 0.99, "min": 0.1, "max": 2.0, "step": 0.01}),
-                "octree_res": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 64}),
-                "voxel_resolution": ("INT", {"default": 128, "min": 32, "max": 1024, "step": 32}),
-                "num_latents": ("INT", {"default": 8192, "min": 1024, "max": 32768, "step": 128}),
-                "chunk_size": ("INT", {"default": 2048, "min": 512, "max": 10000, "step": 512}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                "remove_bg": ("BOOLEAN", {"default": False}),
-                "remove_floaters": ("BOOLEAN", {"default": False}),
-                "low_vram": ("BOOLEAN", {"default": True}),
-                "output_on_cpu": ("BOOLEAN", {"default": True}),
+                "ultrashape_model": ("ULTRASHAPE_MODEL", {"tooltip": "Loaded UltraShape model components."}),
+                "image": ("IMAGE", {"tooltip": "Reference image for 3D shape refinement."}),
+                "mesh": ("TRIMESH", {"tooltip": "Input coarse 3D mesh (Trimesh object) to be refined."}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200, "tooltip": "Number of diffusion sampling steps."}),
+                "guidance_scale": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1, "tooltip": "Classifier-free guidance scale (default CFG max if adaptive CFG is enabled)."}),
+                "scale": ("FLOAT", {"default": 0.99, "min": 0.1, "max": 2.0, "step": 0.01, "tooltip": "Normalization scale for input surface point cloud."}),
+                "octree_res": ("INT", {"default": 1024, "min": 64, "max": 2048, "step": 64, "tooltip": "Resolution for Octree surface extraction during marching cubes."}),
+                "voxel_resolution": ("INT", {"default": 128, "min": 32, "max": 1024, "step": 32, "tooltip": "Voxel resolution for conditioning query grid."}),
+                "num_latents": ("INT", {"default": 8192, "min": 1024, "max": 32768, "step": 128, "tooltip": "Number of surface point tokens to sample and voxelize."}),
+                "chunk_size": ("INT", {"default": 2048, "min": 512, "max": 10000, "step": 512, "tooltip": "Chunk size for surface extraction decoding to save memory."}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Random seed for reproducible sampling."}),
+                "remove_bg": ("BOOLEAN", {"default": False, "tooltip": "Automatically remove background from input image before conditioning."}),
+                "remove_floaters": ("BOOLEAN", {"default": False, "tooltip": "Remove disconnected small mesh floaters post-processing."}),
+                "low_vram": ("BOOLEAN", {"default": True, "tooltip": "Enable CPU offloading during inference to save VRAM."}),
+                "output_on_cpu": ("BOOLEAN", {"default": True, "tooltip": "Keep intermediate output mesh tensors on CPU to prevent OOM."}),
+                "adaptive_cfg": ("BOOLEAN", {"default": False, "tooltip": "Enable adaptive CFG scheduler (sinusoidal guidance scale schedule)."}),
+                "cfg_min": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1, "tooltip": "Minimum guidance scale for adaptive CFG."}),
+                "cfg_max": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 30.0, "step": 0.1, "tooltip": "Maximum guidance scale for adaptive CFG."}),
+                "cfg_start_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start step ratio for adaptive CFG schedule."}),
+                "cfg_end_ratio": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End step ratio for adaptive CFG schedule."}),
             }
         }
 
@@ -151,17 +150,15 @@ class UltraShapeRefine:
     FUNCTION = "refine"
     CATEGORY = "UltraShape"
 
-    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, remove_floaters, low_vram, output_on_cpu):
+    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, remove_floaters, low_vram, output_on_cpu, adaptive_cfg=False, cfg_min=1.0, cfg_max=5.0, cfg_start_ratio=0.0, cfg_end_ratio=1.0):
         components = ultrashape_model["components"]
         config = ultrashape_model["config"]
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Override voxel_query_res in DiT if specified
         if hasattr(components['dit'], 'voxel_query_res'):
             components['dit'].voxel_query_res = voxel_resolution
 
-        # Create Pipeline - start on CPU
         pipeline = UltraShapePipeline(
             vae=components['vae'],
             model=components['dit'],
@@ -182,7 +179,6 @@ class UltraShapeRefine:
             num_uniform_points=204800,
         )
         
-        # Prepare Image
         image_tensor = image[0]
         image_np = (image_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         image_pil = Image.fromarray(image_np).convert("RGBA")
@@ -191,14 +187,9 @@ class UltraShapeRefine:
             rembg = BackgroundRemover()
             image_pil = rembg(image_pil)
         
-        # Prepare Mesh
-        # We can use GPU for voxelization for speed, then move result if needed.
-        # But if VRAM is super tight, maybe voxelize on CPU?
-        # Let's try voxelizing on GPU if available (it's small memory footprint compared to models)
         surface = loader(mesh, normalize_scale=scale).to(device, dtype=torch.float16)
-        pc = surface[:, :, :3] # [B, N, 3]
+        pc = surface[:, :, :3]
         
-        # Voxelize
         _, voxel_idx = voxelize_from_point(pc, num_latents, resolution=voxel_resolution)
         
         print("Running diffusion process...")
@@ -217,6 +208,11 @@ class UltraShapeRefine:
                 num_chunks=chunk_size,
                 num_inference_steps=steps,
                 output_on_cpu=output_on_cpu,
+                adaptive_cfg=adaptive_cfg,
+                cfg_min=cfg_min,
+                cfg_max=cfg_max,
+                cfg_start_ratio=cfg_start_ratio,
+                cfg_end_ratio=cfg_end_ratio,
             )
             
         refined_mesh = mesh_out_list[0]
@@ -225,13 +221,14 @@ class UltraShapeRefine:
             refined_mesh = floater_remover(refined_mesh)
         return (refined_mesh,)
 
-
 class UltraShapeLoadMesh:
+    DESCRIPTION = "Loads a 3D mesh file (OBJ, GLB, STL, PLY, etc.) using Trimesh."
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "path": ("STRING", {"default": "input.glb"}),
+                "path": ("STRING", {"default": "input.glb", "tooltip": "File path to the 3D mesh."}),
             }
         }
     RETURN_TYPES = ("TRIMESH",)
@@ -246,12 +243,14 @@ class UltraShapeLoadMesh:
         return (mesh,)
 
 class UltraShapeSaveMesh:
+    DESCRIPTION = "Saves a 3D mesh (Trimesh object) to disk."
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "mesh": ("TRIMESH",),
-                "filename": ("STRING", {"default": "refined_output.glb"}),
+                "mesh": ("TRIMESH", {"tooltip": "Trimesh object to save."}),
+                "filename": ("STRING", {"default": "refined_output.glb", "tooltip": "Output filename for saved mesh."}),
             }
         }
     RETURN_TYPES = ()
