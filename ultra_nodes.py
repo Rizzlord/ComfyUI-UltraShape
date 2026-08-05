@@ -20,6 +20,7 @@ try:
     from ultrashape.surface_loaders import SharpEdgeSurfaceLoader
     from ultrashape.utils import voxelize_from_point
     from ultrashape.pipelines import UltraShapePipeline
+    from ultrashape import FloaterRemover
     ULTRASHAPE_IMPORT_ERROR = None
 except ImportError as e:
     ULTRASHAPE_IMPORT_ERROR = e
@@ -139,6 +140,7 @@ class UltraShapeRefine:
                 "chunk_size": ("INT", {"default": 2048, "min": 512, "max": 10000, "step": 512}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "remove_bg": ("BOOLEAN", {"default": False}),
+                "remove_floaters": ("BOOLEAN", {"default": False}),
                 "low_vram": ("BOOLEAN", {"default": True}),
                 "output_on_cpu": ("BOOLEAN", {"default": True}),
             }
@@ -149,7 +151,7 @@ class UltraShapeRefine:
     FUNCTION = "refine"
     CATEGORY = "UltraShape"
 
-    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, low_vram, output_on_cpu):
+    def refine(self, ultrashape_model, image, mesh, steps, guidance_scale, scale, octree_res, voxel_resolution, num_latents, chunk_size, seed, remove_bg, remove_floaters, low_vram, output_on_cpu):
         components = ultrashape_model["components"]
         config = ultrashape_model["config"]
         
@@ -218,6 +220,9 @@ class UltraShapeRefine:
             )
             
         refined_mesh = mesh_out_list[0]
+        if remove_floaters:
+            floater_remover = FloaterRemover()
+            refined_mesh = floater_remover(refined_mesh)
         return (refined_mesh,)
 
 
