@@ -723,7 +723,7 @@ class UltraShapePipeline(DiTPipeline):
         **kwargs,
     ) -> List[List[trimesh.Trimesh]]:
         callback = kwargs.pop("callback", None)
-        callback_steps = kwargs.pop("callback_steps", None)
+        callback_steps = kwargs.pop("callback_steps", 1) or 1
 
         self.set_surface_extractor(mc_algo)
 

@@ -127,8 +127,16 @@ def sharp_sample_pointcloud(mesh, num=16384):
     sharp_verts_an = VN[edge_a]
     sharp_verts_bn = VN[edge_b]
 
+    if len(edge_a) == 0 or len(sharp_verts_a) == 0:
+        pts, nrms = sample_pointcloud(mesh, num=num)
+        return pts.numpy(), nrms.numpy()
+
     weights = np.linalg.norm(sharp_verts_b - sharp_verts_a, axis=-1)
-    weights /= np.sum(weights)
+    sum_w = np.sum(weights)
+    if sum_w <= 1e-8 or not np.isfinite(sum_w):
+        pts, nrms = sample_pointcloud(mesh, num=num)
+        return pts.numpy(), nrms.numpy()
+    weights /= sum_w
 
     random_number = np.random.rand(num)
     w = np.random.rand(num, 1)
@@ -139,10 +147,13 @@ def sharp_sample_pointcloud(mesh, num=16384):
 
 
 def load_surface_sharpegde(mesh, num_points=4096, num_sharp_points=4096, sharpedge_flag=True, normalize_scale=0.9999):
-    try:
-        mesh_full = trimesh.util.concatenate(mesh.dump())
-    except Exception as err:
-        mesh_full = trimesh.util.concatenate(mesh)
+    if isinstance(mesh, trimesh.Trimesh):
+        mesh_full = mesh.copy()
+    else:
+        try:
+            mesh_full = trimesh.util.concatenate(mesh.dump())
+        except Exception:
+            mesh_full = trimesh.util.concatenate([mesh] if not isinstance(mesh, (list, tuple)) else mesh)
     mesh_full = normalize_mesh(mesh_full, scale=normalize_scale)
 
     origin_num = mesh_full.faces.shape[0]
