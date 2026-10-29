@@ -280,7 +280,188 @@ class DMCSurfaceExtractor(SurfaceExtractor):
         return vertices, faces
 
 
+def _sparse_marching_cubes(sdf, bmin, bmax, method, level, chunk=1 << 22):
+    """Marching cubes on only the cells that cross the level (isoext SparseGrid).
+
+    Same mesh as dense marching cubes, but no float32 copy of the whole grid and no dense per-cell
+    buffers, which is what lets octree 1024 fit in 16 GB.
+    """
+    import isoext
+
+    n = [int(x) for x in sdf.shape]
+    m = [x - 1 for x in n]
+    ins = sdf < level
+    any_in = ins[:m[0], :m[1], :m[2]].clone()
+    all_in = any_in.clone()
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                s = ins[dx:m[0] + dx, dy:m[1] + dy, dz:m[2] + dz]
+                any_in |= s
+                all_in &= s
+    del ins
+    any_in &= all_in.logical_not_()
+    del all_in
+    cells = torch.nonzero(any_in)
+    del any_in
+    off = torch.tensor([[a, b, c] for a in (0, 1) for b in (0, 1) for c in (0, 1)], device=sdf.device)
+    vals = torch.empty((len(cells), 8), dtype=torch.float32, device=sdf.device)
+    for s0 in range(0, len(cells), chunk):
+        cn = cells[s0:s0 + chunk].unsqueeze(1) + off.unsqueeze(0)
+        vals[s0:s0 + chunk] = sdf[cn[..., 0], cn[..., 1], cn[..., 2]].float()
+        del cn
+    lin = ((cells[:, 0] * m[1] + cells[:, 1]) * m[2] + cells[:, 2]).to(torch.int32).contiguous()
+    del cells
+    # isoext allocates with cudaMalloc directly, so hand PyTorch's cached blocks back first
+    torch.cuda.empty_cache()
+    grid = isoext.SparseGrid(n, bmin, bmax)
+    grid.add_cells(lin)
+    grid.set_values(vals.contiguous())
+    del lin, vals
+    v, f = isoext.marching_cubes(grid, level=level, method=method)
+    del grid
+    return v, f
+
+
+class IsoextSurfaceExtractor(SurfaceExtractor):
+    # above this many grid points (octree > 640) the marching-cubes variants run on a sparse grid
+    LEAN_GRID_POINTS = 641 ** 3
+    SPARSE_METHODS = {
+        "isoext_mc_lewiner": "lewiner",
+        "isoext_mc_vega": "vega",
+        "isoext_mc_nagae": "nagae",
+        "isoext_mc_lorensen": "lorensen",
+    }
+
+    def __init__(self, algo="isoext_mc_lewiner"):
+        self.algo = algo
+
+    def run(self, grid_logit, *, mc_level=0.0, bounds=1.01, octree_resolution=256, **kwargs):
+        _, bbox_min, bbox_size = self._compute_box_stat(bounds, octree_resolution)
+        bmin = [float(bbox_min[0]), float(bbox_min[1]), float(bbox_min[2])]
+        bmax = [
+            float(bbox_min[0] + bbox_size[0]),
+            float(bbox_min[1] + bbox_size[1]),
+            float(bbox_min[2] + bbox_size[2]),
+        ]
+
+        # One owned copy of the grid, prepared in place: at octree 1024 every full-size temporary is
+        # 4 GB in float32, and the old out-of-place version needed four of them at once. isoext only
+        # takes CUDA tensors, and with output_on_cpu the decoder hands the grid over on the CPU.
+        lean = grid_logit.numel() > self.LEAN_GRID_POINTS and self.algo in self.SPARSE_METHODS
+        sdf = grid_logit.detach().to("cuda", torch.float16 if lean else torch.float32, copy=True).contiguous()
+        sdf.nan_to_num_(nan=-10.0).neg_()
+        sdf[0, :, :] = 10.0
+        sdf[-1, :, :] = 10.0
+        sdf[:, 0, :] = 10.0
+        sdf[:, -1, :] = 10.0
+        sdf[:, :, 0] = 10.0
+        sdf[:, :, -1] = 10.0
+
+        level = float(-mc_level)
+        if abs(level) < 1e-6:
+            level = 1.234567e-5
+        # push values lying exactly on the level off it, one slab at a time
+        for s0 in range(0, sdf.shape[0], 64):
+            slab = sdf[s0:s0 + 64]
+            slab[(slab.float() - level).abs_() < 1e-6] += 1e-6
+
+        if lean:
+            v, f = _sparse_marching_cubes(sdf, bmin, bmax, self.SPARSE_METHODS[self.algo], level)
+        else:
+            v, f = self._dense(sdf, bmin, bmax, level)
+        del sdf
+        v_np = v.detach().cpu().numpy().astype(np.float32)
+        f_np = f.detach().cpu().numpy().astype(np.int32)
+        del v, f
+        return self._keep_outer_components(v_np, f_np)
+
+    def _dense(self, sdf, bmin, bmax, level):
+        import isoext
+
+        Rx, Ry, Rz = int(sdf.shape[0]), int(sdf.shape[1]), int(sdf.shape[2])
+        ugrid = isoext.UniformGrid([Rx, Ry, Rz], bmin, bmax)
+        ugrid.set_values(sdf)
+
+        if self.algo == "isoext_mc_vega":
+            v, f = isoext.marching_cubes(ugrid, level=level, method="vega")
+        elif self.algo == "isoext_mc_nagae":
+            v, f = isoext.marching_cubes(ugrid, level=level, method="nagae")
+        elif self.algo == "isoext_mc_lorensen":
+            v, f = isoext.marching_cubes(ugrid, level=level, method="lorensen")
+        elif self.algo == "isoext_dmc_vega":
+            v, f = isoext.dual_marching_cubes(ugrid, level=level, method="vega")
+        elif self.algo == "isoext_dmc_lewiner":
+            v, f = isoext.dual_marching_cubes(ugrid, level=level, method="lewiner")
+        elif self.algo == "isoext_dc_ju":
+            v, f = isoext.dual_contouring(ugrid, level=level, method="ju")
+        elif self.algo == "isoext_dc_carrera":
+            v, f = isoext.dual_contouring(ugrid, level=level, method="carrera")
+        elif self.algo == "isoext_mt":
+            v, f = isoext.marching_tetrahedra(ugrid, level=level)
+        elif self.algo == "isoext_sn":
+            v, f = isoext.surface_nets(ugrid, level=level)
+        else:
+            v, f = isoext.marching_cubes(ugrid, level=level, method="lewiner")
+        del ugrid
+        return v, f
+
+    @staticmethod
+    def _keep_outer_components(v_np, f_np):
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        if len(f_np) > 0:
+            rows = np.concatenate([f_np[:, 0], f_np[:, 1], f_np[:, 2]])
+            cols = np.concatenate([f_np[:, 1], f_np[:, 2], f_np[:, 0]])
+            adj = coo_matrix((np.ones_like(rows), (rows, cols)), shape=(len(v_np), len(v_np)))
+            n_c, c_ids = connected_components(adj, directed=False)
+            if n_c > 1:
+                u_c, counts = np.unique(c_ids[f_np[:, 0]], return_counts=True)
+                order = np.argsort(-counts)
+                max_faces = counts[order[0]]
+                kept_v = []
+                kept_f = []
+                v_offset = 0
+                for idx in order:
+                    if counts[idx] < max(1000, int(0.02 * max_faces)):
+                        break
+                    cid = u_c[idx]
+                    face_mask = c_ids[f_np[:, 0]] == cid
+                    f_sub = f_np[face_mask]
+                    used = np.zeros(len(v_np), dtype=bool)
+                    used[f_sub.reshape(-1)] = True
+                    remap = np.full(len(v_np), -1, dtype=np.int32)
+                    remap[used] = np.arange(used.sum(), dtype=np.int32)
+                    cv = v_np[used]
+                    cf = remap[f_sub]
+                    vt = torch.as_tensor(cv, dtype=torch.float64, device="cuda")
+                    ft = torch.as_tensor(cf, dtype=torch.int64, device="cuda")
+                    svol = float((torch.sum(vt[ft[:, 0]] * torch.cross(vt[ft[:, 1]], vt[ft[:, 2]], dim=-1)) / 6.0).item())
+                    del vt, ft
+                    if svol > 0.0:
+                        kept_v.append(cv)
+                        kept_f.append(cf + v_offset)
+                        v_offset += len(cv)
+                if len(kept_v) > 0:
+                    v_np = np.vstack(kept_v).astype(np.float32)
+                    f_np = np.vstack(kept_f).astype(np.int32)
+
+        return v_np, f_np[:, ::-1]
+
+
 SurfaceExtractors = {
     'mc': MCSurfaceExtractor,
     'dmc': DMCSurfaceExtractor,
+    'isoext_mc_lewiner': lambda: IsoextSurfaceExtractor('isoext_mc_lewiner'),
+    'isoext_mc_vega': lambda: IsoextSurfaceExtractor('isoext_mc_vega'),
+    'isoext_mc_nagae': lambda: IsoextSurfaceExtractor('isoext_mc_nagae'),
+    'isoext_mc_lorensen': lambda: IsoextSurfaceExtractor('isoext_mc_lorensen'),
+    'isoext_dmc_vega': lambda: IsoextSurfaceExtractor('isoext_dmc_vega'),
+    'isoext_dmc_lewiner': lambda: IsoextSurfaceExtractor('isoext_dmc_lewiner'),
+    'isoext_dc_ju': lambda: IsoextSurfaceExtractor('isoext_dc_ju'),
+    'isoext_dc_carrera': lambda: IsoextSurfaceExtractor('isoext_dc_carrera'),
+    'isoext_mt': lambda: IsoextSurfaceExtractor('isoext_mt'),
+    'isoext_sn': lambda: IsoextSurfaceExtractor('isoext_sn'),
 }
+
